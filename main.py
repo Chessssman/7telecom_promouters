@@ -1,5 +1,6 @@
 import logging
 import asyncio
+from geopy.geocoders import Nominatim
 from aiogram import Bot, Dispatcher, types, F, Router  # Импортируем Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 # FSM для промоутера
 class PromoterState(StatesGroup):
     waiting_for_name = State()
-    waiting_for_address = State()
+    waiting_for_location = State()  # Изменили waiting_for_address на waiting_for_location
     waiting_for_work_time = State()
 
 
@@ -188,6 +189,13 @@ def get_manager_payments_period_keyboard():
     builder.adjust(2)
     return builder.as_markup()
 
+def get_location_request_keyboard():
+    builder = ReplyKeyboardBuilder()
+    # request_location=True - это магия, которая создает специальную кнопку
+    builder.add(types.KeyboardButton(text="📍 Отправить геолокацию", request_location=True))
+    # one_time_keyboard=True - клавиатура скроется после нажатия
+    return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
+
 
 # --- Роутер для всех обработчиков ---
 router = Router()
@@ -212,22 +220,50 @@ async def start_report_flow(message: types.Message, state: FSMContext):
 @router.message(PromoterState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
-    await state.set_state(PromoterState.waiting_for_address)
-    await message.reply("Теперь напиши адрес, где будешь работать.")
+    await state.set_state(PromoterState.waiting_for_location)
+    await message.reply(
+        "Отлично. Теперь, пожалуйста, отправь свою геолокацию с помощью кнопки ниже.",
+        reply_markup=get_location_request_keyboard()
+    )
 
+# Этот обработчик сработает, когда пользователь нажмет на кнопку и отправит геолокацию
+@router.message(PromoterState.waiting_for_location, F.location)
+async def process_location(message: types.Message, state: FSMContext):
+    # Инициализируем геокодер. user_agent важен для соблюдения правил Nominatim.
+    geolocator = Nominatim(user_agent="promoter_report_bot")
+    
+    lat = message.location.latitude
+    lon = message.location.longitude
+    
+    # Делаем синхронный запрос. Для высоконагруженных ботов лучше выносить в отдельный поток.
+    try:
+        location_data = geolocator.reverse((lat, lon))
+        address = location_data.address if location_data else "Адрес не определен"
+    except Exception as e:
+        logger.error(f"Ошибка геокодирования: {e}")
+        address = f"Координаты: {lat}, {lon} (ошибка определения адреса)"
 
-@router.message(PromoterState.waiting_for_address)
-async def process_address(message: types.Message, state: FSMContext):
-    await state.update_data(address=message.text)
+    await state.update_data(address=address)
     await state.set_state(PromoterState.waiting_for_work_time)
-    await message.reply("Напиши планируемое время работы (например, 'с 10:00 до 18:00').")
+    
+    await message.reply(
+        f"Твой адрес определен как:\n<b>{address}</b>\n\n"
+        "Теперь напиши планируемое время работы (например, 'с 10:00 до 18:00').",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+# Этот обработчик сработает, если пользователь введет текст вместо геолокации
+@router.message(PromoterState.waiting_for_location)
+async def process_location_invalid(message: types.Message):
+    await message.reply("Пожалуйста, используй кнопку '📍 Отправить геолокацию' для отправки своего местоположения.")
 
 
 @router.message(PromoterState.waiting_for_work_time)
 async def process_work_time(message: types.Message, state: FSMContext, bot: Bot):
     user_data = await state.get_data()
     promoter_name = user_data['name']
-    promoter_address = user_data['address']
+    # promoter_address теперь будет содержать адрес, полученный из геолокации
+    promoter_address = user_data['address'] 
     promoter_work_time = message.text
     promoter_id = message.from_user.id
 
