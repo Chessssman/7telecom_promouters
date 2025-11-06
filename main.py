@@ -93,15 +93,22 @@ def update_report_status(record_id, status):
 
 
 def get_reports_for_period(start_date, end_date):
+    """
+    Более надежная версия функции для получения отчетов за период.
+    Пропускает строки с некорректным форматом даты и логирует их.
+    """
     workbook = init_excel()
     sheet = workbook["Отчеты промоутеров"]
     reports = []
+    # Проходим по строкам, начиная со второй (пропуская заголовок)
     for row_index in range(2, sheet.max_row + 1):
         try:
             report_date_str = sheet.cell(row=row_index, column=1).value
-            # Проверяем, что report_date_str не None и является строкой
+            # Проверяем, что в ячейке есть данные и это строка
             if report_date_str and isinstance(report_date_str, str):
                 report_date = datetime.strptime(report_date_str, "%Y-%m-%d").date()
+                
+                # Основная логика фильтрации по дате
                 if start_date <= report_date <= end_date:
                     reports.append({
                         "Дата": sheet.cell(row=row_index, column=1).value,
@@ -114,23 +121,38 @@ def get_reports_for_period(start_date, end_date):
                         "ID записи": sheet.cell(row=row_index, column=8).value,
                     })
         except (ValueError, TypeError) as e:
-            logger.warning(
-                f"Skipping row {row_index} due to date parsing error: {e}. Data: {sheet.cell(row=row_index, column=1).value}")
+            # Если дата в некорректном формате, логируем ошибку и продолжаем
+            logger.warning(f"Пропущена строка {row_index} из-за ошибки формата даты: {e}. Значение в ячейке: '{sheet.cell(row=row_index, column=1).value}'")
             continue
     return reports
 
-
 def calculate_payments(promoters_reports):
-    payments = {}
+    """
+    Обновленная логика подсчета выплат.
+    Сначала считает количество подтвержденных смен, затем умножает на ставку.
+    """
+    shift_counts = {}
+    payment_per_shift = 1000  # Ставка за одну смену
+
+    # Шаг 1: Подсчет подтвержденных смен для каждого промоутера
     for report in promoters_reports:
+        # Учитываем только подтвержденные выходы
         if report["Статус"] == "Подтвержден":
             promoter_name = report["Имя промоутера"]
-
-            if promoter_name not in payments:
-                payments[promoter_name] = 0
-
-            payment_per_shift = 1000  # Допустим, оплата за одну смену 1000 руб.
-            payments[promoter_name] += payment_per_shift
+            if promoter_name not in shift_counts:
+                shift_counts[promoter_name] = 0
+            shift_counts[promoter_name] += 1
+            
+    # Шаг 2: Расчет итоговой суммы
+    payments = {}
+    for promoter, shifts in shift_counts.items():
+        total_payment = shifts * payment_per_shift
+        payments[promoter] = {
+            "shifts": shifts,
+            "total": total_payment,
+            "rate": payment_per_shift
+        }
+        
     return payments
 
 
@@ -272,66 +294,68 @@ async def process_manager_decision(callback_query: types.CallbackQuery, bot: Bot
         await callback_query.answer("Отчет отклонен!")
 
 
-@router.callback_query(ManagerReportState.waiting_for_report_period, F.data.startswith(('report_', 'payments_')),
-                       F.from_user.id == MANAGER_ID)
+@router.callback_query(ManagerReportState.waiting_for_report_period, F.data.startswith(('report_', 'payments_')), F.from_user.id == MANAGER_ID)
 async def manager_send_report_or_payments(callback_query: types.CallbackQuery, state: FSMContext, bot: Bot):
+    await callback_query.message.delete() # Удаляем сообщение с кнопками выбора периода для чистоты
+    
     command_type, period = callback_query.data.split('_')
-
+    
     end_date = datetime.now().date()
     if period == "today":
         start_date = end_date
+        period_text = "сегодня"
     elif period == "week":
         start_date = end_date - timedelta(days=6)
+        period_text = "неделю"
     elif period == "month":
         start_date = end_date - timedelta(days=29)
+        period_text = "месяц"
+
+    # Получаем отчеты за выбранный период
+    reports = get_reports_for_period(start_date, end_date)
 
     if command_type == "report":
-        reports = get_reports_for_period(start_date, end_date)
-
         if not reports:
-            await callback_query.message.answer(f"За выбранный период ({start_date} - {end_date}) отчетов не найдено.",
-                                                reply_markup=get_manager_keyboard())
+            await callback_query.message.answer(f"За выбранный период ({start_date} - {end_date}) отчетов не найдено.", reply_markup=get_manager_keyboard())
         else:
             report_workbook = openpyxl.Workbook()
             report_sheet = report_workbook.active
             report_sheet.title = "Отчет"
-            report_sheet.append(
-                ["Дата", "Время", "ID промоутера", "Имя промоутера", "Адрес работы", "Планируемое время работы",
-                 "Статус", "ID записи"])
+            report_sheet.append(["Дата", "Время", "ID промоутера", "Имя промоутера", "Адрес работы", "Планируемое время работы", "Статус", "ID записи"])
             for r in reports:
                 report_sheet.append([
-                    r["Дата"], r["Время"], r["ID промоутера"], r["Имя промоутера"],
+                    r["Дата"], r["Время"], r["ID промоутера"], r["Имя промоутера"], 
                     r["Адрес работы"], r["Планируемое время работы"], r["Статус"], r["ID записи"]
                 ])
-
+            
             report_file_name = f"report_{start_date}_{end_date}.xlsx"
             report_workbook.save(report_file_name)
 
             with open(report_file_name, 'rb') as f:
-                await callback_query.message.answer_document(
-                    types.BufferedInputFile(f.read(), filename=report_file_name),
-                    caption=f"Отчет за период с {start_date} по {end_date}",
-                    reply_markup=get_manager_keyboard())
+                await callback_query.message.answer_document(types.BufferedInputFile(f.read(), filename=report_file_name), 
+                                                                 caption=f"Отчет за период с {start_date} по {end_date}", 
+                                                                 reply_markup=get_manager_keyboard())
 
-            os.remove(report_file_name)
+            os.remove(report_file_name) 
 
     elif command_type == "payments":
-        reports = get_reports_for_period(start_date, end_date)
         payments = calculate_payments(reports)
 
         if not payments:
-            await callback_query.message.answer(
-                f"За выбранный период ({start_date} - {end_date}) подтвержденных выходов не найдено для расчета выплат.",
-                reply_markup=get_manager_keyboard())
+            await callback_query.message.answer(f"За выбранный период ({start_date} - {end_date}) подтвержденных выходов для расчета выплат не найдено.", reply_markup=get_manager_keyboard())
         else:
-            payment_message = f"Расчет выплат за период с {start_date} по {end_date}:\n\n"
-            for promoter, amount in payments.items():
-                payment_message += f"- {promoter}: {amount} руб.\n"
+            payment_message = f"Расчет выплат за {period_text} ({start_date} - {end_date}):\n\n"
+            total_sum = 0
+            for promoter, data in payments.items():
+                payment_message += f"– <b>{promoter}</b>: {data['shifts']} смен(ы) * {data['rate']} руб. = <b>{data['total']} руб.</b>\n"
+                total_sum += data['total']
+            
+            payment_message += f"\n<b>Итого к выплате: {total_sum} руб.</b>"
+            
             await callback_query.message.answer(payment_message, reply_markup=get_manager_keyboard())
 
     await state.clear()
     await callback_query.answer()
-
 
 async def main():
     # Инициализация Excel файла при запуске бота
@@ -357,4 +381,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.info("Bot stopped by KeyboardInterrupt")
     except Exception as e:
+
         logger.error(f"Bot stopped with an error: {e}")
